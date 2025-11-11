@@ -673,6 +673,232 @@ def setup_instance_logging(instance_id: str, base_dir: str):
     
     return instance_logger
 
+def process_single_instance(args_tuple: Tuple[str, int, int, str, bool, str]) -> Tuple[str, bool, str]:
+    instance_id, max_iterations, max_finished_nodes, base_dir, resume, result_path = args_tuple
+    
+    def print_progress(message: str):
+        print(f"[{instance_id}] {message}")
+
+    retry_count = 0
+    retry_history = []
+    
+    while retry_count <= MAX_RETRIES:
+        try:
+            if retry_count == 0:
+                print_progress("📋 start...")
+            else:
+                print_progress(f"🔄  {retry_count}/{MAX_RETRIES} - : {retry_history[-1]}")
+            
+            if resume and retry_count == 0:  
+                if is_instance_completed(instance_id, max_iterations, base_dir):
+                    return (instance_id, True, f"Already completed {max_iterations} iterations")
+            
+                success = main(instance_id, max_iterations, max_finished_nodes, result_path)
+                
+                if success:
+                    message = f"Success{retry_info}"
+                    
+                    import random
+                    delay = random.uniform(1.0, 3.0)
+                    time.sleep(delay)
+                    
+                    return (instance_id, success, message)
+            else:
+                print_progress("❌ resolved: False")
+                return (instance_id, False, "Failed to resolve")
+        
+        except Exception as e:
+            error_msg = str(e)
+            full_traceback = traceback.format_exc()
+
+            should_retry, retry_reason = should_retry_error(error_msg, e)
+            
+            if should_retry and retry_count < MAX_RETRIES:
+                retry_count += 1
+                retry_history.append(retry_reason.value)
+
+                wait_time = min(60, 10 * (2 ** (retry_count - 1))) 
+                time.sleep(wait_time)
+                
+                current_date = datetime.now().strftime("%Y-%m-%d")
+                log_file_path = f'{base_dir}/trajectory/{instance_id}/{current_date}_execution.log'
+                try:
+                    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+                    with open(log_file_path, 'a', encoding='utf-8') as f:
+                        f.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - RETRY - INFO - "
+                               f" {retry_count}/{MAX_RETRIES}, : {retry_reason.value}\n")
+                        f.write(f": {error_msg}\n")
+                except Exception:
+                    pass  
+                
+                continue  
+            else:
+                if retry_count >= MAX_RETRIES:
+                    final_error_msg = f"({MAX_RETRIES}). : {error_msg}"
+                    print_progress(f"💥 : {final_error_msg[:100]}...")
+                    
+                    current_date = datetime.now().strftime("%Y-%m-%d")
+                    log_file_path = f'{base_dir}/trajectory/{instance_id}/{current_date}_execution.log'
+                    try:
+                        os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+                        with open(log_file_path, 'a', encoding='utf-8') as f:
+                            f.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - FINAL_FAILURE - ERROR - "
+                                   f" {retry_history}\n")
+                            f.write(f"{error_msg}\n")
+                            f.write(f":\n{full_traceback}\n")
+                    except Exception:
+                        pass
+                        
+                    return (instance_id, False, final_error_msg)
+                else:
+                    return (instance_id, False, f"Non-retryable error: {error_msg}")
+
+    return (instance_id, False, "Unexpected end of retry loop")
+
+
+def process_instances_parallel(instance_ids: List[str], max_iterations: int, 
+                             max_finished_nodes: int, base_dir: str, 
+                             resume: bool = False, num_processes: int = 1, result_path: str = None) -> List[str]:
+    pass_instances = []
+    
+    args_list = [
+        (instance_id, max_iterations, max_finished_nodes, base_dir, resume, result_path) 
+        for instance_id in instance_ids
+    ]
+    
+    if num_processes == 1:
+        for args_tuple in tqdm(args_list, desc="Processing instances",
+                              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+            instance_id, success, message = process_single_instance(args_tuple)
+            if success:
+                if "Already completed" not in message:
+                    pass_instances.append(instance_id)
+                    time.sleep(60)
+                else:
+                    print(f"[{instance_id}] ⏭️ jump")
+            else:
+                print(f"[{instance_id}] ❌ : {message}")
+    else:
+
+        batch_size = num_processes * 2  
+        total_batches = (len(args_list) + batch_size - 1) // batch_size
+        
+        
+        with mp.Pool(processes=num_processes, initializer=init_worker) as pool:
+            results = []
+            completed_tasks = 0
+            
+            with tqdm(total=len(args_list), desc="Processing instances", 
+                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
+                
+                pending_results = {}  
+                submitted_count = 0
+                max_concurrent = min(batch_size, num_processes * 2)  
+                timeout_seconds = 3600  
+                
+                while completed_tasks < len(args_list):
+                    while (submitted_count < len(args_list) and 
+                           len(pending_results) < max_concurrent):
+                        
+                        args_tuple = args_list[submitted_count]
+                        instance_id = args_tuple[0]
+                        
+                        async_result = pool.apply_async(process_single_instance, (args_tuple,))
+                        start_time = time.time()
+                        pending_results[async_result] = (submitted_count, instance_id, start_time)
+                        
+                        if submitted_count % 10 == 0:  
+                            print(f"📤  {submitted_count + 1}/{len(args_list)}: {instance_id}")
+                        
+                        submitted_count += 1
+                        
+                        time.sleep(random.uniform(0.2, 0.8))
+                    
+                    completed_results = []
+                    timeout_results = []
+                    current_time = time.time()
+                    
+                    for async_result, (task_idx, instance_id, start_time) in list(pending_results.items()):
+                        elapsed_time = current_time - start_time
+                        
+                        if async_result.ready():
+                            completed_results.append((async_result, task_idx, instance_id, elapsed_time))
+                        elif elapsed_time > timeout_seconds:
+                            timeout_results.append((async_result, task_idx, instance_id, elapsed_time))
+                    
+                    for async_result, task_idx, instance_id, elapsed_time in timeout_results:
+                        try:
+                            try:
+                                async_result.get(timeout=0.1)
+                            except mp.TimeoutError:
+                                try:
+                                    pass
+                                except Exception as terminate_error:
+                                    print(f"⚠️ : {terminate_error}")
+                            except Exception:
+                                pass
+                            
+                            timeout_message = f"Timeout after {elapsed_time//60:.1f} minutes (worker process may still be running)"
+                            results.append((instance_id, False, timeout_message))
+                            completed_tasks += 1
+                            
+                            pbar.set_postfix_str(f"{instance_id} : {len(pending_results)-1}")
+                            pbar.update(1)
+                            
+                        except Exception as e:
+                            pbar.update(1)
+                            completed_tasks += 1
+                        
+                        del pending_results[async_result]
+                    
+                    for async_result, task_idx, instance_id, elapsed_time in completed_results:
+                        try:
+                            result_id, success, message = async_result.get(timeout=1)
+                            results.append((result_id, success, message))
+                            completed_tasks += 1
+                            
+                            if success and "Already completed" not in message:
+                                pass_instances.append(result_id)
+                            
+                            status = "✅" if success else "❌"
+                            if "Already completed" in message:
+                                status = "⏭️"
+                            
+                            minutes = elapsed_time // 60
+                            seconds = elapsed_time % 60
+                            time_str = f"{minutes:.0f}m{seconds:.0f}s" if minutes > 0 else f"{seconds:.0f}s"
+                            
+                            concurrent_info = f"concurrent: {len(pending_results)-1}"
+                            pbar.set_postfix_str(f"{instance_id} {status}({time_str}) | {concurrent_info}")
+                            pbar.update(1)
+                            
+                            if completed_tasks % 5 == 0:  
+                            
+                            if success:
+                                delay = random.uniform(1.0, 3.0)
+                                time.sleep(delay)
+                            
+                        except mp.TimeoutError:
+                            pbar.update(1)
+                            completed_tasks += 1
+                        except Exception as e:
+                            pbar.update(1)
+                            completed_tasks += 1
+                        
+                        del pending_results[async_result]
+                    
+                    if not completed_results:
+                        time.sleep(1)  
+                    
+                    if completed_tasks > 0 and completed_tasks % 20 == 0:
+                        concurrent_count = len(pending_results)
+                        remaining = len(args_list) - submitted_count
+                        
+                        if concurrent_count > 0:
+                            rest_time = random.uniform(2.0, 5.0)
+                            time.sleep(rest_time)
+    
+    return pass_instances
 
 if __name__ == '__main__':
 
