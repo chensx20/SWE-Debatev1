@@ -177,3 +177,16 @@ Pipfile
 **/moatless-testbeds
 evals
 testbeds
+
+# Experiment cache and results
+entity_pipeline_cache*/
+localization_hints/
+保存/
+留档/
+
+# Misc generated files
+CACHE_OPTIMIZATION_GUIDE.md
+cache_manager.py
+bash.sh
+entity_localization_config.env
+.codex

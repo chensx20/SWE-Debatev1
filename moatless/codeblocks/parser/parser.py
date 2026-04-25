@@ -85,7 +85,7 @@ class CodeParser:
     ):
         try:
             self.tree_parser = Parser()
-            self.tree_parser.language = language
+            self.tree_parser.set_language(language)
             self.tree_language = language
         except Exception as e:
             logger.warning(f"Could not get parser for language {language}.")

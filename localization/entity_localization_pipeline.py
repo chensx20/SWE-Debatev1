@@ -2,6 +2,8 @@ import json
 import os
 import logging
 import re
+import time
+import random
 import threading
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -498,7 +500,16 @@ class EntityLocalizationPipeline:
     3. Generate localization chains for each related entity, grouped by initial entity
     """
 
-    def __init__(self, model_name: str = "deepseek/deepseek-chat", max_depth: int = 5):
+    def __init__(self, model_name: str = None, max_depth: int = 5):
+        # Use provided model_name or fall back to GLOBAL_MODEL env var, then default to "deepseek-chat"
+        env_model = os.getenv("GLOBAL_MODEL")
+        if not model_name:
+            model_name = env_model if env_model else "deepseek-chat"
+            
+        # Strip provider prefix for native OpenAI client compatibility if present (e.g., "deepseek/deepseek-chat" -> "deepseek-chat")
+        if "/" in model_name:
+            model_name = model_name.split("/")[-1]
+            
         self.model_name = model_name
         self.max_depth = max_depth
         self.logger = logging.getLogger(__name__)
@@ -511,18 +522,118 @@ class EntityLocalizationPipeline:
         self.chain_embedding = LocalizationChainEmbedding()
         
         # Cache related configuration
-        self.cache_dir = "/entity_pipeline_cache"
+        self.cache_dir = os.getenv("ENTITY_PIPELINE_CACHE_DIR", "./entity_pipeline_cache")
         self.enable_cache = True
         self._ensure_cache_dir_exists()
         
-        # Initialize the OpenAI client
-        self.client = OpenAI(
-            base_url="",
-            api_key="",
-            timeout=60.0
-        )
+        # API configuration with optimized timeout and retry
+        def _get_positive_float_env(name: str, default: float) -> float:
+            raw = os.getenv(name, str(default))
+            try:
+                value = float(raw)
+                if value <= 0:
+                    raise ValueError
+                return value
+            except (TypeError, ValueError):
+                self.logger.warning(f"Invalid {name}={raw!r}, fallback to {default}")
+                return default
 
-    def _call_llm_simple(self, messages: List[Dict], temp: float = 0.1, max_tokens: int = 1000) -> str:
+        def _get_non_negative_int_env(name: str, default: int) -> int:
+            raw = os.getenv(name, str(default))
+            try:
+                value = int(raw)
+                if value < 0:
+                    raise ValueError
+                return value
+            except (TypeError, ValueError):
+                self.logger.warning(f"Invalid {name}={raw!r}, fallback to {default}")
+                return default
+
+        api_timeout = _get_positive_float_env("ENTITY_LOCALIZATION_TIMEOUT", 1000.0)
+        max_retries = _get_non_negative_int_env("ENTITY_LOCALIZATION_MAX_RETRIES", 3)
+        llm_call_timeout = _get_positive_float_env("LLM_CALL_TIMEOUT", api_timeout)
+        self.llm_call_timeout = llm_call_timeout
+        self.llm_call_timeout_cap = _get_positive_float_env("LLM_CALL_TIMEOUT_CAP", max(1200.0, llm_call_timeout))
+        self.llm_retry_attempts = _get_non_negative_int_env("LLM_RETRY_ATTEMPTS", 2)
+        self.llm_retry_backoff_base = _get_positive_float_env("LLM_RETRY_BACKOFF_BASE", 1.6)
+        self.llm_retry_backoff_max = _get_positive_float_env("LLM_RETRY_BACKOFF_MAX", 8.0)
+        self.llm_timeout_per_1k_input_chars = _get_positive_float_env("LLM_TIMEOUT_PER_1K_INPUT_CHARS", 1.5)
+        self.llm_timeout_per_1k_max_tokens = _get_positive_float_env("LLM_TIMEOUT_PER_1K_MAX_TOKENS", 8.0)
+        self.second_round_max_workers = max(1, _get_non_negative_int_env("SECOND_ROUND_MAX_WORKERS", 1))
+        
+        # Initialize the OpenAI client with optimized settings
+        self.client = OpenAI(
+            base_url=os.getenv("DEEPSEEK_API_BASE", os.getenv("OPENAI_API_BASE", "")),
+            api_key=os.getenv("DEEPSEEK_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+            timeout=api_timeout,
+            max_retries=max_retries
+        )
+        
+        self.logger.info(f"API Configuration: timeout={api_timeout}s, max_retries={max_retries}")
+        self.logger.info(f"LLM Call Timeout (for debate/discussion): {llm_call_timeout}s")
+        self.logger.info(
+            f"LLM Resilience: retry_attempts={self.llm_retry_attempts}, "
+            f"timeout_cap={self.llm_call_timeout_cap}s, backoff_base={self.llm_retry_backoff_base}, "
+            f"backoff_max={self.llm_retry_backoff_max}s"
+        )
+        self.logger.info(f"Second round analysis workers: {self.second_round_max_workers}")
+
+    def _estimate_input_chars(self, messages: List[Dict[str, Any]]) -> int:
+        total = 0
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                total += len(content)
+                continue
+
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, str):
+                        total += len(part)
+                    elif isinstance(part, dict):
+                        text = part.get("text") or part.get("content") or ""
+                        total += len(str(text))
+                    else:
+                        total += len(str(part))
+            else:
+                total += len(str(content))
+        return total
+
+    def _compute_call_timeout(self, input_chars: int, max_tokens: int) -> float:
+        base_timeout = float(self.llm_call_timeout)
+        input_extra = (max(0, input_chars) / 1000.0) * self.llm_timeout_per_1k_input_chars
+        output_extra = (max(0, max_tokens) / 1000.0) * self.llm_timeout_per_1k_max_tokens
+        adaptive_timeout = base_timeout + input_extra + output_extra
+        return min(adaptive_timeout, self.llm_call_timeout_cap)
+
+    @staticmethod
+    def _is_retryable_llm_error(error: Exception) -> bool:
+        error_name = type(error).__name__
+        error_text = str(error).lower()
+
+        retryable_names = {
+            "APIConnectionError",
+            "APITimeoutError",
+            "RateLimitError",
+            "ReadTimeout",
+            "ConnectTimeout",
+            "TimeoutError",
+        }
+
+        if error_name in retryable_names:
+            return True
+
+        retryable_markers = [
+            "connection error",
+            "request timed out",
+            "timed out",
+            "temporarily unavailable",
+            "rate limit",
+            "too many requests",
+        ]
+        return any(marker in error_text for marker in retryable_markers)
+
+    def _call_llm_simple(self, messages: List[Dict], temp: float = 0.1, max_tokens: int = 4000) -> str:
         """
         Simple LLM call function, reusing the logic in entity_search_scorer.py
 
@@ -534,20 +645,70 @@ class EntityLocalizationPipeline:
         Returns:
             Model response text
         """
-        try:
-            response = self.client.chat.completions.create(
-                model="deepseek-v3",
-                messages=messages,
-                temperature=temp,
-                max_tokens=max_tokens,
-                timeout=60
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            logging.error(f"LLM call failed: {e}")
-            raise e
+        input_chars = self._estimate_input_chars(messages)
+        call_timeout = self._compute_call_timeout(input_chars=input_chars, max_tokens=max_tokens)
+        total_attempts = self.llm_retry_attempts + 1
 
-    def run_pipeline(self, instance_data: Dict[str, Any], context: str, max_initial_entities: int = 5) -> str:
+        for attempt in range(1, total_attempts + 1):
+            attempt_started_at = time.time()
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=max_tokens,
+                    timeout=call_timeout,
+                )
+                elapsed = time.time() - attempt_started_at
+                logging.info(
+                    "LLM call succeeded (attempt %s/%s, elapsed=%.2fs, timeout=%.1fs, input_chars=%s, max_tokens=%s)",
+                    attempt,
+                    total_attempts,
+                    elapsed,
+                    call_timeout,
+                    input_chars,
+                    max_tokens,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                elapsed = time.time() - attempt_started_at
+                is_retryable = self._is_retryable_llm_error(e)
+                logging.error(
+                    "LLM call failed (attempt %s/%s, retryable=%s, err_type=%s, elapsed=%.2fs, timeout=%.1fs, input_chars=%s, max_tokens=%s): %s",
+                    attempt,
+                    total_attempts,
+                    is_retryable,
+                    type(e).__name__,
+                    elapsed,
+                    call_timeout,
+                    input_chars,
+                    max_tokens,
+                    e,
+                )
+
+                if (not is_retryable) or attempt >= total_attempts:
+                    raise
+
+                backoff = min(
+                    self.llm_retry_backoff_max,
+                    (self.llm_retry_backoff_base ** (attempt - 1)) + random.uniform(0.0, 0.3),
+                )
+                logging.warning(
+                    "Retrying LLM call in %.2fs due to transient error (%s)",
+                    backoff,
+                    type(e).__name__,
+                )
+                time.sleep(backoff)
+
+        raise RuntimeError("Unexpected retry flow in _call_llm_simple")
+
+    def run_pipeline(
+        self,
+        instance_data: Dict[str, Any],
+        context: str,
+        max_initial_entities: int = 5,
+        stop_after_stage: Optional[str] = None,
+    ) -> Any:
         """
         Run the complete entity localization pipeline.
 
@@ -555,9 +716,10 @@ class EntityLocalizationPipeline:
             instance_data: Instance data containing problem statement and metadata
             context: Context string containing initial entities
             max_initial_entities: Maximum number of initial entities to extract
+            stop_after_stage: Optional stage name to stop after (supports 'stage_7_final_plan' and 'stage_8_edit_agent_prompt')
 
         Returns:
-            Dictionary containing grouped localization chains, final voted result, modification plan, and formatted edit prompt
+            Default returns stage-8 edit prompt text; if stop_after_stage is set, returns data for that stage
         """
         logging.info("=" * 80)
         logging.info("=== Starting Entity Localization Pipeline ===")
@@ -570,6 +732,15 @@ class EntityLocalizationPipeline:
         logging.info(f"Problem statement length: {len(instance_data.get('problem_statement', ''))}")
         logging.info("=" * 80)
 
+        instance_id = instance_data.get('instance_id', 'unknown')
+        
+        # Check if we have cached result for this instance
+        if self.enable_cache:
+            cached_result = self._load_cached_pipeline_result(instance_id, stop_after_stage)
+            if cached_result:
+                logging.info(f"✅ Loaded cached result for instance {instance_id}")
+                return cached_result
+        
         # Setup current issue
         set_current_issue(instance_data=instance_data)
         logging.info("Current issue setup completed")
@@ -579,7 +750,6 @@ class EntityLocalizationPipeline:
         
         # Generate cache timestamp
         cache_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        instance_id = instance_data.get('instance_id', 'unknown')
         
         logging.info(f"cache timestamp: {cache_timestamp}")
 
@@ -778,6 +948,10 @@ class EntityLocalizationPipeline:
                 cache_timestamp
             )
 
+            if stop_after_stage == 'stage_7_final_plan':
+                logging.info("Stopping pipeline after stage_7_final_plan as requested")
+                return modification_plan
+
             # Stage 8: Format output for edit agent
             edit_agent_prompt = self._format_edit_agent_prompt(
                 instance_data['problem_statement'],
@@ -791,6 +965,10 @@ class EntityLocalizationPipeline:
                 'winning_chain': voting_result['winning_chain']
             }
             self._save_stage_result(instance_id, 'stage_8_edit_agent_prompt', stage8_data, cache_timestamp)
+
+            if stop_after_stage == 'stage_8_edit_agent_prompt':
+                logging.info("Stopping pipeline after stage_8_edit_agent_prompt as requested")
+                return edit_agent_prompt
 
             result = {
                 'instance_id': instance_data['instance_id'],
@@ -865,7 +1043,7 @@ class EntityLocalizationPipeline:
             response = self._call_llm_simple(
                 messages=messages,
                 temp=0.7,
-                max_tokens=1000
+                max_tokens=4000
             )
 
             # Parsing JSON Response
@@ -1000,7 +1178,7 @@ class EntityLocalizationPipeline:
         try:
             logging.info("Call LLM to extract entity...")
             response = self.client.chat.completions.create(
-                model="deepseek-v3",
+                model=self.model_name,
                 messages=messages,
                 temperature=0.7,
             )
@@ -1107,7 +1285,7 @@ class EntityLocalizationPipeline:
             response = self._call_llm_simple(
                 messages=messages,
                 temp=0.7,
-                max_tokens=1000
+                max_tokens=4000
             )
 
             response_text = response.strip()
@@ -1194,7 +1372,7 @@ class EntityLocalizationPipeline:
             response = self._call_llm_simple(
                 messages=messages,
                 temp=0.7,
-                max_tokens=1000
+                max_tokens=4000
             )
 
             response_text = response.strip()
@@ -1752,7 +1930,7 @@ class EntityLocalizationPipeline:
                 response = self._call_llm_simple(
                     messages=messages,
                     temp=0.7,  
-                    max_tokens=2000
+                    max_tokens=4000
                 )
 
                 vote_result = self._parse_vote_result(response, agent_id)
@@ -1983,7 +2161,7 @@ class EntityLocalizationPipeline:
                 response = self._call_llm_simple(
                     messages=messages,
                     temp=0.7,
-                    max_tokens=3000
+                    max_tokens=5000
                 )
 
                 analysis = self._parse_modification_analysis(response, agent_id, "first_round")
@@ -2080,8 +2258,12 @@ class EntityLocalizationPipeline:
                 }
 
         valid_first_round = [a for a in first_round_analyses if a.get('analysis')]
+        if not valid_first_round:
+            logging.warning("No valid first-round analyses; skip second-round analysis.")
+            return second_round_results
 
-        with ThreadPoolExecutor(max_workers=min(len(valid_first_round), 1)) as executor:
+        max_workers = max(1, min(len(valid_first_round), self.second_round_max_workers))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(analyze_worker_round2, analysis) for analysis in valid_first_round]
 
             for future in as_completed(futures):
@@ -2462,4 +2644,55 @@ class EntityLocalizationPipeline:
         except Exception as e:
             logging.error(f"Failed to list instance cache files: {e}")
             return []
+    
+    def _load_cached_pipeline_result(self, instance_id: str, stop_after_stage: Optional[str] = None) -> Optional[Any]:
+        """Load cached pipeline result from latest cache file for the requested stage."""
+        try:
+            instance_dir = os.path.join(self.cache_dir, instance_id)
+            if not os.path.exists(instance_dir):
+                return None
+            
+            # Find the latest cache file
+            cache_files = [f for f in os.listdir(instance_dir) if f.endswith('_pipeline_cache.json')]
+            if not cache_files:
+                return None
+            
+            # Sort by timestamp (newest first)
+            cache_files.sort(reverse=True)
+            latest_cache_file = os.path.join(instance_dir, cache_files[0])
+            
+            with open(latest_cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            if stop_after_stage == 'stage_7_final_plan' and 'stage_7_final_plan' in cache_data:
+                stage7_data = cache_data['stage_7_final_plan']['data']
+                if isinstance(stage7_data, dict):
+                    logging.info(f"✅ Found cached stage_7_final_plan in {latest_cache_file}")
+                    return stage7_data.get('final_plan', stage7_data)
+
+            if stop_after_stage == 'stage_8_edit_agent_prompt' and 'stage_8_edit_agent_prompt' in cache_data:
+                stage8_data = cache_data['stage_8_edit_agent_prompt']['data']
+                if isinstance(stage8_data, dict) and 'edit_agent_prompt' in stage8_data:
+                    logging.info(f"✅ Found cached stage_8_edit_agent_prompt in {latest_cache_file}")
+                    return stage8_data['edit_agent_prompt']
+                if isinstance(stage8_data, str):
+                    logging.info(f"✅ Found cached stage_8_edit_agent_prompt in {latest_cache_file}")
+                    return stage8_data
+
+            # Check if we have the final result (stage 8)
+            if 'stage_8_edit_agent_prompt' in cache_data:
+                stage8_data = cache_data['stage_8_edit_agent_prompt']['data']
+                # Return the edit_agent_prompt string
+                if isinstance(stage8_data, dict) and 'edit_agent_prompt' in stage8_data:
+                    logging.info(f"✅ Found complete cached pipeline result in {latest_cache_file}")
+                    return stage8_data['edit_agent_prompt']
+                elif isinstance(stage8_data, str):
+                    logging.info(f"✅ Found complete cached pipeline result in {latest_cache_file}")
+                    return stage8_data
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Failed to load cached pipeline result: {e}")
+            return None
 

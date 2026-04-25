@@ -12,7 +12,7 @@ from dependency_graph.build_graph import (
 )
 import pickle
 import os
-GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR", "index_data/graph_index")
+GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR", "./tmp/graph_index")
 
 
 def parse_raw_loc_output(raw_output, valid_files):

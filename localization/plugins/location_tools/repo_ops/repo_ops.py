@@ -92,6 +92,7 @@ def set_current_issue(instance_id: str = None,
             logging.info(f"[DEBUG] Graph built successfully. Node count: {len(G.nodes())}, Edge count: {len(G.edges())}")
         except Exception as e:
             logging.error(f'[{rank}] Error processing {CURRENT_ISSUE_ID}: {e}')
+            raise  # <-- Raise the exception to prevent accessing unbound 'G'
     else:
         G = pickle.load(open(graph_index_file, "rb"))
         

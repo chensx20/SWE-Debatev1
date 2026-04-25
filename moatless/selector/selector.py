@@ -110,7 +110,7 @@ class Selector(BaseModel):
         ..., description="The type of selector"
     )
     minimum_reward_threshold: float = Field(
-        default=-float("inf"),
+        default=-1e10,
         description="Minimum reward threshold for node selection. Nodes below this value will not be considered.",
     )
     exploitation_weight: float = Field(

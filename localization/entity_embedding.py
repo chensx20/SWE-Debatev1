@@ -9,7 +9,7 @@ class LocalizationChainEmbedding:
     """Localization chain embedding calculator"""
     
     def __init__(self, model_name: str = "intfloat/multilingual-e5-large-instruct", 
-                 cache_dir: str = '/data/swebench/workspace_agentless/Agentless/models'):
+                 cache_dir: str = None):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
         

@@ -1,4 +1,5 @@
 import json
+import re
 import json_repair
 import logging
 import os
@@ -404,18 +405,28 @@ class SearchTree(BaseModel):
                     node=node
                 )
                 node.completions["value_function"] = completion_response
-                import re
-                match = re.search(r"```(?:\w+)?\n?(.*?)```", completion_response.response['choices'][0]['message']['content'], re.DOTALL)
-                if match:
-                    logger.info("Match" + match.group(1).strip())
-                    json_data = match.group(1).strip()
+                json_data = None
+                try:
+                    content = completion_response.response.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    if content:
+                        match = re.search(r"```(?:\w+)?\n?(.*?)```", content, re.DOTALL)
+                        if match:
+                            logger.info("Match" + match.group(1).strip())
+                            json_data = match.group(1).strip()
+                    else:
+                        logger.warning(f"Node{node.node_id}: No content found in completion response")
+                except (AttributeError, KeyError, IndexError, TypeError) as e:
+                    logger.warning(f"Node{node.node_id}: Failed to extract content from completion response: {e}")
 
-                f = json_repair.loads(json_data)
-                node.feedback_data = FeedbackData(
-                                                analysis=None,
-                                                feedback=f['feedback'],
-                                                suggested_node_id=None,
-                                            )
+                if json_data:
+                    f = json_repair.loads(json_data)
+                    node.feedback_data = FeedbackData(
+                                                    analysis=None,
+                                                    feedback=f.get('feedback'),
+                                                    suggested_node_id=None,
+                                                )
+                else:
+                    logger.warning(f"Node{node.node_id}: No JSON data found in value function response.")
                 self.log(
                     logger.info,
                     f"Node{node.node_id}: The value function returned a reward of {node.reward.value}.",

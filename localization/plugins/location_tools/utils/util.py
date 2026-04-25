@@ -7,7 +7,7 @@ from util.benchmark.setup_repo import setup_repo
 
 
 # SET THIS IF YOU WANT TO USE THE PREPROCESSED FILES
-GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR")
+GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR", "./tmp/graph_index")
 BM25_INDEX_DIR = os.environ.get("BM25_INDEX_DIR")
 assert GRAPH_INDEX_DIR != ''
 assert BM25_INDEX_DIR != ''

@@ -6,7 +6,7 @@ from moatless.codeblocks.parser.parser import CodeParser
 
 class JavaParser(CodeParser):
     def __init__(self, **kwargs):
-        super().__init__(Language(java.language()), **kwargs)
+        super().__init__(Language(java.language(), "java"), **kwargs)
         self.queries = []
         self.queries.extend(self._build_queries("java.scm"))
         self.gpt_queries = []

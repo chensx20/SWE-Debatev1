@@ -12,6 +12,9 @@ import multiprocessing as mp
 from datetime import datetime
 from typing import Dict, List, Tuple
 from tqdm import tqdm
+import warnings
+# Suppress Pydantic serialization warnings that clutter the logs
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
 
 # Add localization directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'localization'))
@@ -316,7 +319,7 @@ def get_path_to_leaf(leaf_node_id, tree):
         return f"error: {e}"
 
 
-def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_testbed=False):
+def main(instance_id, max_iterations, max_finish_nodes, result_path=None, use_testbed=False, stop_after_stage=None):
     if result_path is None:
         base_dir = os.path.abspath("tmp")
     else:
@@ -324,74 +327,64 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
     
     instance_logger = setup_instance_logging(instance_id, base_dir)
 
-    import sys
-    from contextlib import redirect_stdout, redirect_stderr
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    log_file_path = f'{base_dir}/trajectory/{instance_id}/{current_date}_execution.log'
-
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-    instance_logger.info(f"🚀 Processing instance: {instance_id}")
+    instance_logger.info("=" * 100)
+    instance_logger.info("🚀 STARTING NEW EXPERIMENT RUN")
+    instance_logger.info("=" * 100)
+    instance_logger.info(f"� Instance ID: {instance_id}")
     instance_logger.info(f"📁 Base directory: {base_dir}")
     instance_logger.info(f"🔄 Max iterations: {max_iterations}")
     instance_logger.info(f"🎯 Max finished nodes: {max_finish_nodes}")
+    instance_logger.info(f"⏰ Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    instance_logger.info("=" * 100)
 
     retry_count = 0
     MAX_RETRIES = 3 
 
-    class LogFileRedirect:
-        def __init__(self, log_file_path):
-            self.log_file_path = log_file_path
-            
-        def write(self, text):
-            if text.strip(): 
-                with open(self.log_file_path, 'a', encoding='utf-8') as f:
-                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - STDOUT - INFO - {text}")
-                    
-        def flush(self):
-            pass
-    
-    log_redirect = LogFileRedirect(log_file_path)
-    
-    while True:  
+    while True:
         try:
-            sys.stdout = log_redirect
+            global_model = os.getenv("GLOBAL_MODEL", "deepseek/deepseek-chat")
+            instance_logger.info(f"🤖 Using model: {global_model}")
 
             from moatless.completion.react import ReActCompletionModel
-            react_completion_model = ReActCompletionModel(model="deepseek/deepseek-chat", temperature=0.7)
-            completion_model = CompletionModel(model="deepseek/deepseek-chat", temperature=0.7)
-            discriminator_model = CompletionModel(model="deepseek/deepseek-chat", temperature=1)
-            value_model = CompletionModel(model="deepseek/deepseek-chat", temperature=0.2)
-
-            completion_model = CompletionModel(model="deepseek/deepseek-chat", temperature=0.7)
+            react_completion_model = ReActCompletionModel(model=global_model, temperature=0.7)
+            completion_model = CompletionModel(model=global_model, temperature=0.7)
+            discriminator_model = CompletionModel(model=global_model, temperature=1)
+            value_model = CompletionModel(model=global_model, temperature=0.4)
 
             react_completion_model.response_format = LLMResponseFormat.REACT
             completion_model.response_format = LLMResponseFormat.REACT
             discriminator_model.response_format = LLMResponseFormat.REACT
             value_model.response_format = LLMResponseFormat.REACT
 
-            instance = get_moatless_instance(instance_id=instance_id)  
+            instance_logger.info("📥 Loading instance from SWE-bench...")
+            instance = get_moatless_instance(instance_id=instance_id)
+            instance_logger.info(f"✅ Instance loaded: {instance.get('instance_id', 'unknown')}")
+            instance_logger.info(f"📝 Problem statement preview: {instance.get('problem_statement', '')[:200]}...")
             
+            instance_logger.info("🏗️ Creating repository...")
             repository = create_repository(instance)
+            instance_logger.info(f"✅ Repository created at: {repository.repo_dir if hasattr(repository, 'repo_dir') else 'N/A'}")
         
-            # Set up index store directory
             index_store_dir = os.getenv("INDEX_STORE_DIR", os.path.abspath("tmp/index_store"))
             
             instance_logger.info("🧠 Loading Code Index...")
             code_index = CodeIndex.from_index_name(
                 instance["instance_id"], file_repo=repository, index_store_dir=index_store_dir
             )
+            instance_logger.info("✅ Code Index loaded successfully")
 
             instance_logger.info("📄 Initializing file context...")
             file_context = FileContext(repo=repository)
+            instance_logger.info("✅ File context initialized")
 
-            current_date = datetime.now().strftime("%Y-%m-%d")
+            current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             instance_path = f'{base_dir}/trajectory/{instance_id}/'
-            persist_path = f'{base_dir}/trajectory/{instance_id}/{current_date}_trajectory.json'
+            persist_path = f'{base_dir}/trajectory/{instance_id}/run_{current_datetime}_trajectory.json'
             
-            instance_logger.info(f"📊 Trajectory: {persist_path}")
+            instance_logger.info(f"📊 Trajectory will be saved to: {persist_path}")
 
             instance_logger.info("⚙️ Setting up actions and system prompt...")
+            
             value_function = ValueFunction(completion_model=value_model)
             actions = [
                 FindClass(completion_model=react_completion_model, code_index=code_index, repository=repository),
@@ -403,6 +396,7 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
                 CreateFile(repository=repository, code_index=code_index),
                 Finish(),
             ]
+            instance_logger.info(f"   Available actions: {[action.__class__.__name__ for action in actions]}")
 
             system_prompt = AGENT_ROLE
             if completion_model.response_format == LLMResponseFormat.REACT:
@@ -412,36 +406,81 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
             workflow_prompt = generate_workflow_prompt(actions, has_runtime=True)
             system_prompt += workflow_prompt + generate_guideline_prompt(has_runtime=True) + ADDITIONAL_NOTES
 
-            instance_logger.info(f"system_prompt:\n{system_prompt}")
-            instance_logger.info("🤖 Initializing agent...")
+            instance_logger.info(f"✅ System prompt length: {len(system_prompt)} characters")
+            instance_logger.info("🤖 Initializing Coding Agent...")
             agent = CodingAgent(system_prompt=system_prompt, actions=actions, completion=react_completion_model)
+            instance_logger.info("✅ Agent initialized successfully")
 
+            instance_logger.info("🎭 Initializing Discriminator (Multi-Agent Debate)...")
             discriminator = AgentDiscriminator(
                 completion=discriminator_model,
                 n_agents=5,
                 n_rounds=3,
             )
+            instance_logger.info(f"   Debate config: {5} agents, {3} rounds")
 
+            instance_logger.info("💬 Initializing Feedback Agent...")
             feedback_generator = FeedbackAgent(
                 completion_model=completion_model, instance_dir=instance_path
             )
+            instance_logger.info("✅ Feedback agent initialized")
 
-            instance_logger.info("🌳 Creating search tree...")
+            instance_logger.info("=" * 100)
+            instance_logger.info("🎯 ENTITY LOCALIZATION PHASE")
+            instance_logger.info("=" * 100)
 
             from entity_localization_pipeline import EntityLocalizationPipeline
 
-            # pipeline = EntityLocalizationPipeline(model_name=completion_model.model)
             pipeline = EntityLocalizationPipeline()
+            instance_logger.info("🔍 Running entity localization pipeline...")
             results = pipeline.run_pipeline(
-                instance,"context",
-                max_initial_entities=5
+                instance, "context",
+                max_initial_entities=5,
+                stop_after_stage=stop_after_stage,
             )
-          
+            instance_logger.info(f"✅ Entity localization completed")
+            results_str = str(results)
+            instance_logger.info(f"   Results: {results_str[:500]}..." if len(results_str) > 500 else f"   Results: {results}")
+
+            if stop_after_stage == "stage_7_final_plan":
+                # In stage-7-only mode, mark success only when a valid final plan exists.
+                if isinstance(results, dict):
+                    if results.get("error"):
+                        instance_logger.warning(
+                            f"⚠️ stage_7_final_plan not produced: {results.get('error')}"
+                        )
+                        return False
+
+                    if results.get("success") is False:
+                        instance_logger.warning(
+                            f"⚠️ stage_7_final_plan generation failed: {results.get('error', 'unknown error')}"
+                        )
+                        return False
+
+                    final_plan = results.get("final_plan")
+                    if not final_plan:
+                        instance_logger.warning("⚠️ stage_7_final_plan is missing in pipeline result")
+                        return False
+
+                instance_logger.info("🛑 stop_after_stage=stage_7_final_plan set, skipping stage 8+ and MCTS search")
+                return True
+
+            if stop_after_stage == "stage_8_edit_agent_prompt":
+                # In stage-8-only mode, mark success only when edit prompt exists.
+                if not isinstance(results, str) or not results.strip():
+                    instance_logger.warning("⚠️ stage_8_edit_agent_prompt is missing or empty")
+                    return False
+
+                instance_logger.info("🛑 stop_after_stage=stage_8_edit_agent_prompt set, skipping MCTS search")
+                return True
+
+            instance_logger.info("=" * 100)
+            instance_logger.info("🌳 SEARCH TREE INITIALIZATION")
+            instance_logger.info("=" * 100)
 
             search_tree = SearchTree.create(
                 message=f'{results}',
                 agent=agent,
-                # assistant=agent,
                 file_context=file_context,
                 value_function=value_function,
                 discriminator=discriminator,
@@ -453,26 +492,44 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
                 max_duplicate_count=5, 
                 persist_path=persist_path,
             )
+            instance_logger.info(f"✅ Search tree created")
+            instance_logger.info(f"   Max iterations: {max_iterations}")
+            instance_logger.info(f"   Max finished nodes: {max_finish_nodes}")
+            instance_logger.info(f"   Max expansions per node: 3")
+            instance_logger.info(f"   Max depth: 20")
 
-            instance_logger.info("🔍 Starting search...")
+            instance_logger.info("=" * 100)
+            instance_logger.info("🔍 STARTING MCTS SEARCH")
+            instance_logger.info("=" * 100)
+            
             finished_node = search_tree.run_search()
             
-            instance_logger.info("💾 Saving Search Tree...")
+            instance_logger.info("=" * 100)
+            instance_logger.info("💾 SAVING SEARCH TREE")
+            instance_logger.info("=" * 100)
             search_tree.persist(persist_path)
+            instance_logger.info(f"✅ Search tree saved to: {persist_path}")
 
             if finished_node:
-                # if finished_node.is_finished():
+                instance_logger.info("=" * 100)
+                instance_logger.info("🎉 SOLUTION FOUND - GENERATING PATCH")
+                instance_logger.info("=" * 100)
+                
                 if finished_node.file_context.generate_git_patch():
-
-                    logger.info(f"{instance} patch: {finished_node.file_context.generate_git_patch()}")
+                    patch = finished_node.file_context.generate_git_patch()
+                    instance_logger.info(f"✅ Git patch generated successfully")
+                    instance_logger.info(f"   Patch length: {len(patch)} characters")
+                    instance_logger.info(f"   Patch preview:\n{patch[:500]}..." if len(patch) > 500 else f"   Patch:\n{patch}")
 
                     eva2rollout = get_leaves_with_patch(search_tree)
                     
                     eva2rollout['source_tree_path'] = persist_path
                     eva2rollout['debate_node'] = str(finished_node.node_id)
                     save2json(eva2rollout, f'/tmp/trajectory/{instance_id}/eval2rollout.json')
+                    instance_logger.info(f"✅ Evaluation data saved to: /tmp/trajectory/{instance_id}/eval2rollout.json")
 
                     if not search_tree.get_finished_nodes() and finished_node.file_context.generate_git_patch():
+                        instance_logger.info("📝 Saving single finished node patch...")
                         tmp = {
                             "model_name_or_path": "DeepSeek_IA",
                             "instance_id": instance_id,
@@ -483,9 +540,13 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
                         }
                         add_data_to_jsonl('/tmp_patch_1.jsonl', tmp)
                         add_data_to_jsonl('/tmp_patch_2.jsonl', tmp)
+                        instance_logger.info("✅ Patch saved to /tmp_patch_1.jsonl and /tmp_patch_2.jsonl")
 
                     new_eval_objects = []
-                    for i in search_tree.get_finished_nodes():
+                    finished_nodes = search_tree.get_finished_nodes()
+                    instance_logger.info(f"📊 Found {len(finished_nodes)} finished nodes in search tree")
+                    
+                    for i in finished_nodes:
                         trajectory = f'Issue: {instance["problem_statement"]}\nTrajectory:\n'
                         trajectory += get_path_to_leaf(i.node_id, search_tree)
                         trajectory += f"\nGenerated Patch:\n{i.file_context.generate_git_patch()}"
@@ -501,9 +562,11 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
                         new_eval_objects.append(tmp)
 
                     if len(new_eval_objects) > 1:
+                        instance_logger.info(f"💾 Saving {len(new_eval_objects)} evaluation objects...")
                         add_data_to_jsonl('/tmp_patch_1.jsonl', new_eval_objects[0])
                         add_data_to_jsonl('/tmp_patch_2.jsonl', new_eval_objects[1])
                     elif len(new_eval_objects) == 1:
+                        instance_logger.info(f"💾 Saving 1 evaluation object...")
                         add_data_to_jsonl('/tmp_patch_1.jsonl', new_eval_objects)
                         add_data_to_jsonl('/tmp_patch_2.jsonl', new_eval_objects)
                     
@@ -514,14 +577,30 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
                         "model_patch": finished_node.file_context.generate_git_patch(),
                     }   
                     add_data_to_jsonl('/tmp_prediction_patch.jsonl', tmp)
+                    instance_logger.info("✅ Prediction patch saved to /tmp_prediction_patch.jsonl")
+                    
+                    instance_logger.info("=" * 100)
+                    instance_logger.info("✅ EXPERIMENT COMPLETED SUCCESSFULLY")
+                    instance_logger.info("=" * 100)
+                    instance_logger.info(f"⏰ End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    instance_logger.info(f"🎯 Solution found at node: {finished_node.node_id}")
+                    instance_logger.info("=" * 100)
 
             else:
-                instance_logger.warning("⚠️ Finished node not found - the search ended normally but no solution was found")
+                instance_logger.warning("=" * 100)
+                instance_logger.warning("⚠️ NO SOLUTION FOUND")
+                instance_logger.warning("=" * 100)
+                instance_logger.warning("The search ended normally but no solution was found")
+                instance_logger.warning(f"⏰ End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                instance_logger.warning("=" * 100)
                 return False
                 
         except Exception as e:
             error_msg = str(e)
-            instance_logger.error(f"❌ Instance {instance_id} error: {error_msg}")
+            instance_logger.error("=" * 100)
+            instance_logger.error("❌ EXCEPTION OCCURRED")
+            instance_logger.error("=" * 100)
+            instance_logger.error(f"Error message: {error_msg}")
             import traceback
             full_traceback = traceback.format_exc()
             instance_logger.error(f"📋 Detailed traceback:\n{full_traceback}")
@@ -529,27 +608,26 @@ def main(instance_id, max_iterations, max_finish_nodes, result_path=None,use_tes
             if "MCTS_DUPLICATES_EXCEEDED" in error_msg:
                 if retry_count >= MAX_RETRIES:
                     instance_logger.error(f"❌ Maximum retry limit ({MAX_RETRIES}) reached, abandoning this instance")
+                    instance_logger.error("=" * 100)
                     return False
                 retry_count += 1
                 instance_logger.warning(f"⚠️ Too many duplicate nodes detected, retrying attempt {retry_count}...")
+                instance_logger.warning("=" * 100)
                 continue
 
             should_retry, retry_reason = should_retry_error(error_msg, e)
             if should_retry:
                 if retry_count >= MAX_RETRIES:
                     instance_logger.error(f"❌ Maximum retry limit ({MAX_RETRIES}) reached, abandoning this instance")
+                    instance_logger.error("=" * 100)
                     return False
                 retry_count += 1
                 instance_logger.warning(f"⚠️ Retryable error ({retry_reason.value}) occurred, retry attempt {retry_count}...")
+                instance_logger.warning("=" * 100)
                 continue
 
-            return False
-            
-        finally:
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-            
-    return False  
+            instance_logger.error("=" * 100)
+            return False  
 
 
 def parse_slice(slice_str: str) -> slice:
@@ -579,14 +657,16 @@ def parse_slice(slice_str: str) -> slice:
 
 
 def setup_instance_logging(instance_id: str, base_dir: str):
-    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = f'{base_dir}/trajectory/{instance_id}/'
     os.makedirs(log_dir, exist_ok=True)
     
-
-    log_file = f'{log_dir}/{current_date}_execution.log'
-    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    log_file = f'{log_dir}/run_{current_datetime}_execution.log'
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     file_handler.setFormatter(file_formatter)
     
     instance_logger = logging.getLogger(f"instance_{instance_id}")
@@ -673,14 +753,15 @@ def setup_instance_logging(instance_id: str, base_dir: str):
     
     return instance_logger
 
-def process_single_instance(args_tuple: Tuple[str, int, int, str, bool, str]) -> Tuple[str, bool, str]:
-    instance_id, max_iterations, max_finished_nodes, base_dir, resume, result_path = args_tuple
+def process_single_instance(args_tuple: Tuple[str, int, int, str, bool, str, str]) -> Tuple[str, bool, str]:
+    instance_id, max_iterations, max_finished_nodes, base_dir, resume, result_path, stop_after_stage = args_tuple
     
     def print_progress(message: str):
         print(f"[{instance_id}] {message}")
 
     retry_count = 0
     retry_history = []
+    MAX_RETRIES = 3
     
     while retry_count <= MAX_RETRIES:
         try:
@@ -693,16 +774,23 @@ def process_single_instance(args_tuple: Tuple[str, int, int, str, bool, str]) ->
                 if is_instance_completed(instance_id, max_iterations, base_dir):
                     return (instance_id, True, f"Already completed {max_iterations} iterations")
             
-                success = main(instance_id, max_iterations, max_finished_nodes, result_path)
+            success = main(
+                instance_id,
+                max_iterations,
+                max_finished_nodes,
+                result_path,
+                stop_after_stage=stop_after_stage,
+            )
+            
+            if success:
+                retry_info = f" (after {retry_count} retries)" if retry_count > 0 else ""
+                message = f"Success{retry_info}"
                 
-                if success:
-                    message = f"Success{retry_info}"
-                    
-                    import random
-                    delay = random.uniform(1.0, 3.0)
-                    time.sleep(delay)
-                    
-                    return (instance_id, success, message)
+                import random
+                delay = random.uniform(1.0, 3.0)
+                time.sleep(delay)
+                
+                return (instance_id, success, message)
             else:
                 print_progress("❌ resolved: False")
                 return (instance_id, False, "Failed to resolve")
@@ -756,13 +844,24 @@ def process_single_instance(args_tuple: Tuple[str, int, int, str, bool, str]) ->
     return (instance_id, False, "Unexpected end of retry loop")
 
 
+def init_worker():
+    """Initializer for multiprocessing workers."""
+    # Keep workers from handling Ctrl+C directly; let main process coordinate shutdown.
+    try:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+
 def process_instances_parallel(instance_ids: List[str], max_iterations: int, 
                              max_finished_nodes: int, base_dir: str, 
-                             resume: bool = False, num_processes: int = 1, result_path: str = None) -> List[str]:
+                             resume: bool = False, num_processes: int = 1, result_path: str = None,
+                             stop_after_stage: str = None) -> List[str]:
     pass_instances = []
     
     args_list = [
-        (instance_id, max_iterations, max_finished_nodes, base_dir, resume, result_path) 
+        (instance_id, max_iterations, max_finished_nodes, base_dir, resume, result_path, stop_after_stage)
         for instance_id in instance_ids
     ]
     
@@ -794,7 +893,7 @@ def process_instances_parallel(instance_ids: List[str], max_iterations: int,
                 pending_results = {}  
                 submitted_count = 0
                 max_concurrent = min(batch_size, num_processes * 2)  
-                timeout_seconds = 3600  
+                timeout_seconds = 7200  
                 
                 while completed_tasks < len(args_list):
                     while (submitted_count < len(args_list) and 
@@ -873,6 +972,7 @@ def process_instances_parallel(instance_ids: List[str], max_iterations: int,
                             pbar.update(1)
                             
                             if completed_tasks % 5 == 0:  
+                                pass
                             
                             if success:
                                 delay = random.uniform(1.0, 3.0)
@@ -900,6 +1000,18 @@ def process_instances_parallel(instance_ids: List[str], max_iterations: int,
     
     return pass_instances
 
+
+def get_retry_info_for_instance(instance_id: str, base_dir: str) -> List[str]:
+    try:
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        log_file_path = f'{base_dir}/trajectory/{instance_id}/{current_date}_execution.log'
+        if os.path.exists(log_file_path):
+            with open(log_file_path, 'r', encoding='utf-8') as f:
+                return [line for line in f.readlines() if "RETRY" in line or "retry" in line]
+    except Exception:
+        pass
+    return []
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="Process some arguments.")
@@ -908,7 +1020,7 @@ if __name__ == '__main__':
     parser.add_argument("--instance_ids", type=str, required=True,
                         help="The file path to instance ID(s)")
 
-    parser.add_argument("--max_iterations", type=int, default=10, help="Max iteration for tree search")
+    parser.add_argument("--max_iterations", type=int, default=50, help="Max iteration for tree search (default: 50, recommended: 50-200 depending on complexity)")
 
     parser.add_argument("--max_finished_nodes", type=int, default=3, help="Max finished nodes for tree search")
 
@@ -919,6 +1031,13 @@ if __name__ == '__main__':
     parser.add_argument("--result_path", type=str, default=None, help="Custom result directory path (default: tmp/experience)")
 
     parser.add_argument("--slice", type=str, default=None, help="Python slice syntax to select instances (e.g., '0:10', '10:', ':5', '10:20:2')")
+    parser.add_argument(
+        "--stop_after_stage",
+        type=str,
+        default=None,
+        choices=["stage_7_final_plan", "stage_8_edit_agent_prompt"],
+        help="Stop after the specified localization stage and skip later phases",
+    )
 
     args = parser.parse_args()
 
@@ -950,7 +1069,15 @@ if __name__ == '__main__':
 
         instance_id = instance_ids[0]
 
-        args_tuple = (instance_id, args.max_iterations, args.max_finished_nodes, base_dir, args.resume, args.result_path)
+        args_tuple = (
+            instance_id,
+            args.max_iterations,
+            args.max_finished_nodes,
+            base_dir,
+            args.resume,
+            args.result_path,
+            args.stop_after_stage,
+        )
         instance_id_result, success, message = process_single_instance(args_tuple)
         
         if success:
@@ -964,7 +1091,16 @@ if __name__ == '__main__':
             if "retry" in message:
                 print(f"📊 retry: {message}")
     else:
-        pass_instances = process_instances_parallel(instance_ids, args.max_iterations, args.max_finished_nodes, base_dir, args.resume, args.num_processes, args.result_path)
+        pass_instances = process_instances_parallel(
+            instance_ids,
+            args.max_iterations,
+            args.max_finished_nodes,
+            base_dir,
+            args.resume,
+            args.num_processes,
+            args.result_path,
+            args.stop_after_stage,
+        )
         success_rate = len(pass_instances) / len(instance_ids)
         print(f"\n🎯 Final Result:")
         print(f"   Success Rate: {success_rate:.2%} ({len(pass_instances)}/{len(instance_ids)})")
@@ -977,15 +1113,3 @@ if __name__ == '__main__':
             print(f" 💫 Instances that successfully passed retry: {retry_count}/{len(pass_instances)}")
 
     print('\n🏁 All done!')
-
-
-def get_retry_info_for_instance(instance_id: str, base_dir: str) -> List[str]:
-    try:
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        log_file_path = f'{base_dir}/trajectory/{instance_id}/{current_date}_execution.log'
-        if os.path.exists(log_file_path):
-            with open(log_file_path, 'r', encoding='utf-8') as f:
-                return [line for line in f.readlines() if "RETRY" in line or "retry" in line]
-    except Exception:
-        pass
-    return []

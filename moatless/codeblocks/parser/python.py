@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class PythonParser(CodeParser):
     def __init__(self, **kwargs):
-        language = Language(tspython.language())
+        language = Language(tspython.language(), "python")
 
         super().__init__(language, **kwargs)
 

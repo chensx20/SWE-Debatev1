@@ -158,7 +158,7 @@ for output in tqdm(output_data):
             
     instance_id = output['instance_id']
     set_current_issue(instance_data=output)
-    GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR")
+    GRAPH_INDEX_DIR = os.environ.get("GRAPH_INDEX_DIR", "./tmp/graph_index")
     G = pickle.load(
         open(f"{GRAPH_INDEX_DIR}/{instance_id}.pkl", "rb")
     )
