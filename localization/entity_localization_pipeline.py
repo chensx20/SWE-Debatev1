@@ -28,6 +28,239 @@ from dependency_graph.build_graph import (
 from util.utils import convert_to_json
 from entity_embedding import LocalizationChainEmbedding
 
+
+# ===========================================================================
+# STAGE 2 OPTIMIZATION: Common Name Blacklist
+# Names too generic to usefully seed localization chains.
+# ===========================================================================
+COMMON_NAME_BLACKLIST = frozenset({
+    # common verbs / functions
+    'run', 'get', 'set', 'test', 'check', 'make', 'create', 'build',
+    'init', 'setup', 'clear', 'reset', 'clean', 'open', 'close',
+    'start', 'stop', 'begin', 'end', 'finish', 'done', 'wait', 'sleep',
+    'load', 'save', 'read', 'write', 'print', 'log', 'debug',
+    'handle', 'process', 'parse', 'format', 'convert', 'transform',
+    'update', 'modify', 'change', 'edit', 'fix', 'repair', 'patch',
+    'add', 'remove', 'delete', 'insert', 'append', 'prepend',
+    'find', 'search', 'filter', 'sort', 'order', 'group', 'split',
+    'join', 'merge', 'combine', 'connect', 'disconnect', 'attach',
+    'bind', 'call', 'invoke', 'execute', 'perform', 'do', 'act',
+    'return', 'yield', 'pass', 'raise', 'throw', 'error', 'fail',
+    # generic variable names
+    'data', 'value', 'result', 'item', 'element', 'node', 'key', 'val',
+    'count', 'num', 'n', 'i', 'j', 'k', 'idx', 'index', 'pos', 'loc',
+    'flag', 'status', 'state', 'mode', 'type', 'name', 'id', 'uid',
+    'path', 'dir', 'file', 'url', 'uri', 'link', 'src', 'dst',
+    # common class suffixes that are too broad on their own
+    'base', 'core', 'main', 'helper', 'utils', 'util', 'common',
+    'manager', 'handler', 'controller', 'processor', 'provider',
+    # OOP primitives
+    'self', 'cls', 'this', 'null', 'none', 'true', 'false', 'empty',
+})
+
+
+def _is_common_name(entity_id: str) -> bool:
+    """Return True if entity_id is too generic to be a useful search seed."""
+    base = re.sub(r'[_:\-\.]+', '', entity_id.lower())
+    return base in COMMON_NAME_BLACKLIST
+
+
+# ===========================================================================
+# STAGE 6 OPTIMIZATION: Differentiated Voting Personas
+# Each agent evaluates from a unique professional perspective.
+# ===========================================================================
+AGENT_PERSONAS = {
+    1: {
+        "name": "Testing Expert",
+        "system": (
+            "You are a software testing expert. "
+            "Evaluate chains by testability: does modifying this chain make it easy to write a focused regression test? "
+            "Prioritise locations where a fix can be verified through existing or simple new tests."
+        ),
+    },
+    2: {
+        "name": "API Designer",
+        "system": (
+            "You are an API design expert. "
+            "Evaluate chains by interface impact: where would a change minimise API disruption for callers? "
+            "Prioritise clean entry points with low downstream coupling."
+        ),
+    },
+    3: {
+        "name": "Data-Flow Analyst",
+        "system": (
+            "You are a data-flow analyst. "
+            "Trace how incorrect values propagate. "
+            "Prioritise the origin of bad data or the earliest transformation that corrupts it."
+        ),
+    },
+    4: {
+        "name": "Risk Assessor",
+        "system": (
+            "You are a risk-management engineer. "
+            "Evaluate blast radius: which chain is safest to modify? "
+            "Prefer isolated code paths with narrow side-effects."
+        ),
+    },
+    5: {
+        "name": "Debugging Detective",
+        "system": (
+            "You are a debugging specialist who follows stack traces. "
+            "Evaluate chains by symptom proximity: where do errors first manifest? "
+            "Prefer locations with the best observability into the fault."
+        ),
+    },
+}
+
+PERSONA_SCORING_PROMPT = """
+{persona_system}
+
+---
+
+**ISSUE DESCRIPTION (truncated):**
+{issue_description}
+
+**CANDIDATE LOCALIZATION CHAINS:**
+{chains_info}
+
+---
+
+**TASK — score every chain on a 1-5 integer scale:**
+1 = clearly wrong place
+2 = tangentially relevant
+3 = acceptable candidate
+4 = strong candidate
+5 = optimal fix location
+
+Return ONLY valid JSON (no markdown fences):
+{{
+    "scores": {{
+        "chain_1": {{"score": <int>, "reasoning": "<one sentence>"}},
+        "chain_2": {{"score": <int>, "reasoning": "<one sentence>"}},
+        ...
+    }},
+    "recommended_chain": "chain_X",
+    "confidence": <float 0-1>
+}}
+"""
+
+
+# ===========================================================================
+# STAGE 3 OPTIMIZATION: Beam Search (replaces per-entity DFS)
+# Single LLM call per expansion step; shared visited across beams.
+# ===========================================================================
+
+class _BeamSearch:
+    """Width-limited beam search over the dependency graph."""
+
+    def __init__(self, width: int = 3, max_depth: int = 5, pipeline=None):
+        self.width = width
+        self.max_depth = max_depth
+        self.pipeline = pipeline
+        self.llm_calls = 0
+
+    # ------------------------------------------------------------------
+    def _neighbours(self, entity_id, dep_searcher):
+        out = []
+        for direction in ('downstream', 'upstream'):
+            fwd = 'forward' if direction == 'downstream' else 'backward'
+            for etype in ('imports', 'invokes', 'contains'):
+                try:
+                    nids, _ = dep_searcher.get_neighbors(entity_id, fwd, etype_filter=[etype])
+                    for nid in nids:
+                        out.append({'entity_id': nid, 'edge_type': etype, 'direction': direction})
+                except Exception:
+                    pass
+        return out
+
+    # ------------------------------------------------------------------
+    def _decide(self, current, neighbours, issue_desc, depth):
+        """Single LLM call: prefilter + select merged."""
+        if not neighbours or depth >= self.max_depth - 1:
+            return {'continue': False}
+
+        listing = "\n".join(
+            f"  {i+1}. {n['entity_id']} ({n['edge_type']}, {n['direction']})"
+            for i, n in enumerate(neighbours[:6])
+        )
+        prompt = (
+            f"Issue (truncated): {issue_desc[:350]}\n\n"
+            f"Current entity: {current}  (depth {depth})\n"
+            f"Candidate neighbours:\n{listing}\n\n"
+            "Pick the single BEST neighbour to continue the chain, plus up to 2 back-ups.\n"
+            'Return JSON only: {"continue": true/false, "selected": "...", "backups": ["...", "..."]}'
+        )
+        try:
+            raw = self.pipeline._call_llm_simple(
+                messages=[{"role": "user", "content": prompt}],
+                temp=0.7, max_tokens=600,
+            )
+            self.llm_calls += 1
+            text = raw.strip()
+            if text.startswith('```json'):
+                text = text[7:]
+            if text.endswith('```'):
+                text = text[:-3]
+            return json.loads(text)
+        except Exception as exc:
+            logging.debug("Beam-search LLM fallback: %s", exc)
+            return {
+                'continue': bool(neighbours),
+                'selected': neighbours[0]['entity_id'] if neighbours else None,
+                'backups': [n['entity_id'] for n in neighbours[1:3]],
+            }
+
+    # ------------------------------------------------------------------
+    def search(self, start, issue_desc, dep_searcher, shared_visited):
+        """Return best chain (list[str]) starting from *start*."""
+        shared_visited.add(start)
+        beam = [(start, [start])]  # (current, path)
+        best = [start]
+
+        for _ in range(self.max_depth):
+            if not beam:
+                break
+            next_beam = []
+            for current, path in beam:
+                if len(path) > self.max_depth:
+                    continue
+                nbrs = [n for n in self._neighbours(current, dep_searcher)
+                         if n['entity_id'] not in shared_visited]
+                if not nbrs:
+                    if len(path) > len(best):
+                        best = path[:]
+                    continue
+
+                dec = self._decide(current, nbrs, issue_desc, len(path) - 1)
+                if not dec.get('continue', False):
+                    if len(path) > len(best):
+                        best = path[:]
+                    continue
+
+                nid_set = {n['entity_id'] for n in nbrs}
+                candidates = []
+                sel = dec.get('selected')
+                if sel and sel in nid_set:
+                    candidates.append(sel)
+                for b in dec.get('backups', []):
+                    if b and b in nid_set and b not in candidates:
+                        candidates.append(b)
+
+                for cand in candidates:
+                    shared_visited.add(cand)
+                    new_path = path + [cand]
+                    next_beam.append((cand, new_path))
+                    if len(new_path) > len(best):
+                        best = new_path[:]
+
+            # prune to beam width
+            next_beam.sort(key=lambda x: -len(x[1]))
+            beam = next_beam[:self.width]
+
+        logging.info("Beam search: chain_len=%d  llm_calls=%d", len(best), self.llm_calls)
+        return best
+
+
 # Extract the prompt template of the entity from the context (reuse ENTITY_EXTRACTION_PROMPT in entity_search_scorer.py)
 ENTITY_EXTRACTION_PROMPT = """
 You are a code analysis expert. Given an issue description, your task is to identify the most relevant code entities (classes, methods, functions, variables) that are likely involved in the issue.
@@ -1097,6 +1330,18 @@ class EntityLocalizationPipeline:
         logging.info(f"Extracting related entities from code snippets...")
         related_entities = self._extract_entities_from_code_snippets(code_snippets, problem_statement)
 
+        # Stage 2 Opt: drop entities whose id is in the common-name blacklist
+        before_count = len(related_entities)
+        related_entities = [
+            e for e in related_entities
+            if not _is_common_name(e.get('entity_id', ''))
+        ]
+        if len(related_entities) < before_count:
+            logging.info(
+                f"[Stage2-Opt] Filtered {before_count - len(related_entities)} "
+                f"common-name entities, kept {len(related_entities)}"
+            )
+
         logging.info(f"Found {len(related_entities)} related entities for '{initial_entity}'")
         for i, entity in enumerate(related_entities):
             logging.info(
@@ -1110,12 +1355,20 @@ class EntityLocalizationPipeline:
         """
         Search for code snippets containing the given entity name.
 
+        [Stage 2 Opt] Skips names in COMMON_NAME_BLACKLIST early to avoid
+        flooding downstream stages with irrelevant snippets.
+
         Args:
             entity_name: Entity name to search for
 
         Returns:
             Found code snippets as string
         """
+        # Stage 2 Opt: skip overly-generic names
+        if _is_common_name(entity_name):
+            logging.info(f"[Stage2-Opt] Skipping common name: '{entity_name}'")
+            return ""
+
         # Use the entity name as search term
         search_terms = [entity_name]
 
@@ -1560,7 +1813,12 @@ class EntityLocalizationPipeline:
 
     def _generate_localization_chains(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Stage 3: Generate localization chains for each entity using DFS graph traversal (parallel version).
+        Stage 3: Generate localization chains for each entity.
+
+        [Stage 3 Opt] Uses _BeamSearch instead of DFS:
+        - Single LLM call per expansion (merged prefilter + select)
+        - Shared visited set across all entities → no redundant exploration
+        - Fixed beam width prevents combinatorial explosion
 
         Args:
             entities: List of extracted entities
@@ -1568,7 +1826,7 @@ class EntityLocalizationPipeline:
         Returns:
             List of localization chains, one for each entity
         """
-        logging.info("=== Stage 3: Generating Localization Chains (Parallel) ===")
+        logging.info("=== Stage 3: Generating Localization Chains (Beam Search) ===")
 
         if not entities:
             logging.warning("No entities are used to generate positioning chains")
@@ -1578,21 +1836,15 @@ class EntityLocalizationPipeline:
         entity_searcher = get_graph_entity_searcher()
         dependency_searcher = get_graph_dependency_searcher()
 
+        # Shared visited set across ALL entities in this group —
+        # avoids redundant exploration of the same sub-graph.
+        shared_visited = set()
+        shared_visited_lock = threading.Lock()
 
         all_chains = []
         chain_lock = threading.Lock()
 
         def generate_chain_worker(entity_index: int, entity: Dict[str, Any]) -> Dict[str, Any]:
-            """
-            Generate worksheet for location chain of a single entity
-
-            Args:
-                entity_index: The index of the entity in the list
-                entity: Entity information dictionary
-
-            Returns:
-                A dictionary containing information about the location chain
-            """
             entity_id = entity['entity_id']
             logging.info(f"entity {entity_index + 1}/{len(entities)}: {entity_id}")
 
@@ -1606,23 +1858,35 @@ class EntityLocalizationPipeline:
                         'error': 'Entity not found in graph'
                     }
 
-                # Perform DFS traversal for this entity (now returns simplified chain)
-                chain = self._dfs_traversal(
-                    start_entity=entity_id,
-                    graph=graph,
-                    entity_searcher=entity_searcher,
-                    dependency_searcher=dependency_searcher,
-                    max_depth=self.max_depth
+                # Stage 3 Opt: beam search with shared visited
+                beam = _BeamSearch(
+                    width=3,
+                    max_depth=self.max_depth,
+                    pipeline=self,
                 )
+
+                with shared_visited_lock:
+                    local_visited = set(shared_visited)
+
+                chain = beam.search(
+                    start=entity_id,
+                    issue_desc=self._current_issue_description,
+                    dep_searcher=dependency_searcher,
+                    shared_visited=local_visited,
+                )
+
+                # Merge back into the shared set
+                with shared_visited_lock:
+                    shared_visited.update(local_visited)
 
                 chain_info = {
                     'start_entity': entity,
-                    'chain': chain,  # Now contains only entity IDs
+                    'chain': chain,
                     'chain_length': len(chain)
                 }
 
                 if chain:
-                    logging.info(f"Simplified positioning chain: {chain}")
+                    logging.info(f"Beam-search chain: {chain}")
 
                 return chain_info
 
@@ -1882,7 +2146,13 @@ class EntityLocalizationPipeline:
     def _vote_on_chains(self, chains_with_code: List[Dict[str, Any]], issue_description: str, num_agents: int = 5) -> \
             Dict[str, Any]:
         """
-        Stage 6: Use multiple agents to vote on the positioning chain
+        Stage 6: Evaluate localization chains using differentiated expert personas.
+
+        [Stage 6 Opt] Replaces identical-prompt majority voting with:
+        - 5 agents each assigned a distinct professional persona
+        - Continuous 1-5 scoring per chain instead of binary vote
+        - Weighted aggregation by agent confidence
+        - Same number of LLM calls, much better discrimination
 
         Args:
             chains_with_code: List of location chains containing code
@@ -1892,7 +2162,8 @@ class EntityLocalizationPipeline:
         Returns:
             vote results
         """
-        logging.info(f"=== Stage 6: Use {num_agents} agents to vote on {len(chains_with_code)} location chains ===")
+        num_agents = min(num_agents, len(AGENT_PERSONAS))
+        logging.info(f"=== Stage 6 (Persona Scoring): {num_agents} experts on {len(chains_with_code)} chains ===")
 
         if not chains_with_code:
             return {
@@ -1904,68 +2175,76 @@ class EntityLocalizationPipeline:
 
         chains_info = self._format_chains_for_voting(chains_with_code)
 
-        vote_results = []
-        vote_lock = threading.Lock()
+        score_results = []
+        score_lock = threading.Lock()
 
-        def vote_worker(agent_id: int) -> Dict[str, Any]:
+        def score_worker(agent_id: int) -> Dict[str, Any]:
+            persona = AGENT_PERSONAS[agent_id]
             try:
-                logging.info(f"Agent {agent_id} begin...")
+                logging.info(f"Agent {agent_id} ({persona['name']}) starting...")
 
-                prompt = CHAIN_VOTING_PROMPT.format(
-                    issue_description=issue_description,
-                    chains_info=chains_info
+                prompt = PERSONA_SCORING_PROMPT.format(
+                    persona_system=persona['system'],
+                    issue_description=issue_description[:800],
+                    chains_info=chains_info,
                 )
 
                 messages = [
-                    {
-                        "role": "system",
-                        "content": "You are an expert software engineer with deep experience in code analysis and debugging."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": persona['system']},
+                    {"role": "user", "content": prompt},
                 ]
 
                 response = self._call_llm_simple(
                     messages=messages,
-                    temp=0.7,  
-                    max_tokens=4000
+                    temp=0.7,
+                    max_tokens=4000,
                 )
 
-                vote_result = self._parse_vote_result(response, agent_id)
+                result = self._parse_persona_score(response, agent_id)
 
-                with vote_lock:
-                    vote_results.append(vote_result)
-                    logging.info(f"Agent {agent_id} complete: {vote_result.get('voted_chain_id', 'unknown')}")
+                with score_lock:
+                    score_results.append(result)
+                    logging.info(
+                        f"Agent {agent_id} ({persona['name']}) → "
+                        f"recommended {result.get('recommended_chain', '?')}"
+                    )
 
-                return vote_result
+                return result
 
             except Exception as e:
                 logging.error(f"Agent {agent_id} fail: {e}")
                 return {
                     'agent_id': agent_id,
-                    'voted_chain_id': None,
+                    'scores': {},
+                    'recommended_chain': None,
                     'confidence': 0,
-                    'reasoning': f'fail: {e}',
-                    'error': str(e)
+                    'error': str(e),
                 }
 
-        with ThreadPoolExecutor(max_workers=min(num_agents, 3)) as executor:
-            futures = [executor.submit(vote_worker, i + 1) for i in range(num_agents)]
+        with ThreadPoolExecutor(max_workers=num_agents) as executor:
+            futures = [executor.submit(score_worker, i + 1) for i in range(num_agents)]
 
             for future in as_completed(futures):
                 try:
-                    future.result()  
+                    future.result()
                 except Exception as e:
-                    logging.error(f"Voting thread abnormality: {e}")
+                    logging.error(f"Scoring thread exception: {e}")
 
-        voting_summary = self._analyze_voting_results(vote_results, chains_with_code)
+        voting_summary = self._aggregate_persona_scores(score_results, chains_with_code)
 
-        logging.info(f"Voting completed, winning chain: {voting_summary.get('winning_chain_id', 'None')}")
+        logging.info(f"Persona scoring completed, winning chain: {voting_summary.get('winning_chain_id', 'None')}")
         return voting_summary
 
     def _format_chains_for_voting(self, chains_with_code: List[Dict[str, Any]]) -> str:
+        """
+        Format chains for voting/scoring prompts.
+
+        [Fix] Truncates code to prevent 504 timeouts from massive prompts.
+        Each entity's code is capped at 300 chars; total chain capped at 2000 chars.
+        """
+        MAX_CODE_PER_ENTITY = 300
+        MAX_CHAIN_LENGTH = 2000
+
         chains_info_parts = []
 
         for chain_data in chains_with_code:
@@ -1973,62 +2252,121 @@ class EntityLocalizationPipeline:
             entities = chain_data['entities_with_code']
 
             chain_info = f"**{chain_id.upper()}:**\n"
+            chain_length = len(chain_info)
 
             for i, entity in enumerate(entities):
-                entity_info = f"Entity {i + 1}: {entity['entity_id']}\n"
-                entity_info += f"Code:\n{entity.get('code', '# No code available')}\n\n"
+                entity_id = entity['entity_id']
+                code = entity.get('code', '# No code available')
+
+                # Truncate code if too long
+                if len(code) > MAX_CODE_PER_ENTITY:
+                    code = code[:MAX_CODE_PER_ENTITY] + f"\n... (truncated, {len(code)} chars total)"
+
+                entity_info = f"Entity {i + 1}: {entity_id}\n"
+                entity_info += f"Type: {entity.get('type', 'unknown')}\n"
+                entity_info += f"Code:\n{code}\n\n"
+
+                # Stop if chain gets too long
+                if chain_length + len(entity_info) > MAX_CHAIN_LENGTH:
+                    chain_info += f"... (chain truncated after {i} entities)\n"
+                    break
+
                 chain_info += entity_info
+                chain_length += len(entity_info)
 
             chains_info_parts.append(chain_info)
 
-        return "\n".join(chains_info_parts)
+        result = "\n".join(chains_info_parts)
+        logging.info(f"Formatted chains for voting: {len(result)} chars total")
+        return result
 
-    def _parse_vote_result(self, response: str, agent_id: int) -> Dict[str, Any]:
+    def _parse_persona_score(self, response: str, agent_id: int) -> Dict[str, Any]:
+        """Parse the JSON scoring result from a persona agent."""
         try:
-            response_text = response.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text[7:]
-            if response_text.endswith('```'):
-                response_text = response_text[:-3]
+            text = response.strip()
+            if text.startswith('```json'):
+                text = text[7:]
+            if text.startswith('```'):
+                text = text[3:]
+            if text.endswith('```'):
+                text = text[:-3]
 
-            vote_data = json.loads(response_text)
-            vote_data['agent_id'] = agent_id
+            data = json.loads(text.strip())
+            data['agent_id'] = agent_id
 
-            if 'voted_chain_id' not in vote_data:
-                raise ValueError("Missing voted_chain_id")
+            if 'scores' not in data or not isinstance(data['scores'], dict):
+                raise ValueError("Missing or invalid 'scores' field")
 
-            logging.info(f"Agent {agent_id} success: {vote_data['voted_chain_id']}")
-            return vote_data
+            return data
 
         except Exception as e:
-            logging.error(f"Agent {agent_id} fail: {e}")
+            logging.error(f"Agent {agent_id} parse fail: {e}")
             return {
                 'agent_id': agent_id,
-                'voted_chain_id': None,
+                'scores': {},
+                'recommended_chain': None,
                 'confidence': 0,
-                'reasoning': f'fail: {e}',
-                'error': str(e)
+                'error': str(e),
             }
 
-    def _analyze_voting_results(self, vote_results: List[Dict[str, Any]], chains_with_code: List[Dict[str, Any]]) -> \
-            Dict[str, Any]:
-        valid_votes = [v for v in vote_results if v.get('voted_chain_id') and 'error' not in v]
-        invalid_votes = [v for v in vote_results if 'error' in v or not v.get('voted_chain_id')]
+    def _aggregate_persona_scores(
+        self,
+        score_results: List[Dict[str, Any]],
+        chains_with_code: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Aggregate per-chain scores across all persona agents.
 
-        logging.info(f"Valid votes: {len(valid_votes)}, Invalid votes: {len(invalid_votes)}")
+        Uses confidence-weighted averaging: score_i * confidence_i / sum(confidence).
+        Tie-breaker: highest single-agent score.
+        """
+        valid = [s for s in score_results if s.get('scores') and 'error' not in s]
+        invalid = [s for s in score_results if 'error' in s or not s.get('scores')]
 
-        if not valid_votes:
+        logging.info(f"Valid scores: {len(valid)}, Invalid: {len(invalid)}")
+
+        if not valid:
             return {
                 'success': False,
-                'error': 'No valid votes received',
-                'votes': vote_results,
-                'winning_chain': None
+                'error': 'No valid scores received',
+                'votes': score_results,
+                'winning_chain': None,
             }
 
-        vote_counts = Counter(v['voted_chain_id'] for v in valid_votes)
+        totals: Dict[str, float] = {}
+        weights: Dict[str, float] = {}
+        max_scores: Dict[str, float] = {}
 
-        winning_chain_id = vote_counts.most_common(1)[0][0]
-        winning_votes = vote_counts[winning_chain_id]
+        for sr in valid:
+            conf = float(sr.get('confidence', 0.5))
+            for chain_id, chain_score in sr['scores'].items():
+                val = float(chain_score.get('score', 0) if isinstance(chain_score, dict) else chain_score)
+                totals[chain_id] = totals.get(chain_id, 0.0) + val * conf
+                weights[chain_id] = weights.get(chain_id, 0.0) + conf
+                max_scores[chain_id] = max(max_scores.get(chain_id, 0.0), val)
+
+        averages = {
+            cid: totals[cid] / weights[cid]
+            for cid in totals
+            if weights[cid] > 0
+        }
+
+        if not averages:
+            return {
+                'success': False,
+                'error': 'Could not compute weighted averages',
+                'votes': score_results,
+                'winning_chain': None,
+            }
+
+        # Sort: weighted average desc, then max score as tie-breaker
+        ranked = sorted(
+            averages.items(),
+            key=lambda x: (x[1], max_scores.get(x[0], 0)),
+            reverse=True,
+        )
+
+        winning_chain_id = ranked[0][0]
 
         winning_chain_data = None
         for chain in chains_with_code:
@@ -2036,24 +2374,24 @@ class EntityLocalizationPipeline:
                 winning_chain_data = chain
                 break
 
-        winning_confidences = [v.get('confidence', 0) for v in valid_votes if v['voted_chain_id'] == winning_chain_id]
-        avg_confidence = sum(winning_confidences) / len(winning_confidences) if winning_confidences else 0
-
         voting_summary = {
             'success': True,
             'winning_chain_id': winning_chain_id,
             'winning_chain': winning_chain_data,
-            'winning_votes': winning_votes,
-            'total_valid_votes': len(valid_votes),
-            'average_confidence': avg_confidence,
-            'vote_distribution': dict(vote_counts),
-            'all_votes': vote_results,
-            'valid_votes': valid_votes,
-            'invalid_votes': invalid_votes
+            'winning_score': ranked[0][1],
+            'total_valid_votes': len(valid),
+            'average_confidence': sum(s.get('confidence', 0) for s in valid) / len(valid),
+            'score_distribution': averages,
+            'max_scores': max_scores,
+            'all_votes': score_results,
+            'valid_votes': valid,
+            'invalid_votes': invalid,
         }
 
-        logging.info(f"Voting result analysis completed:")
-        logging.info(f"  Winning chain: {winning_chain_id}")
+        logging.info(f"Persona scoring result:")
+        logging.info(f"  Winner: {winning_chain_id} (weighted avg = {ranked[0][1]:.2f})")
+        for cid, avg in ranked[:3]:
+            logging.info(f"  {cid}: avg={avg:.2f}  max={max_scores.get(cid, 0):.0f}")
 
         return voting_summary
 
@@ -2242,7 +2580,7 @@ class EntityLocalizationPipeline:
                 response = self._call_llm_simple(
                     messages=messages,
                     temp=0.7,
-                    max_tokens=6000
+                    max_tokens=8000
                 )
 
                 refined_analysis = self._parse_modification_analysis(response, agent_id, "second_round")
